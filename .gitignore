@@ -1,4 +1,11 @@
+*~
+build
+doc/*.xml
+tests/solver/data.libzypp/*/*.result
+src/solvversion.h
+
+# Nexus packaging
+arch/pkg/
+arch/src/
 *.pkg.tar.zst
 *.pkg.tar.zst.sig
-pkg/
-src/
