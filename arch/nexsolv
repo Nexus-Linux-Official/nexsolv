@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""nexsolv - human-readable Arch Linux dependency solver built on libsolv.
+
+This is a dry-run solver: it reads the pacman sync databases and the local
+package database, resolves a transaction with libsolv's SAT solver, and prints
+the result. It never installs, removes or downloads packages.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import os
+import platform
+import subprocess
+import sys
+from pathlib import Path
+
+try:
+    import solv
+except ImportError:
+    sys.exit(
+        "nexsolv: Python libsolv bindings not found. "
+        "Install the 'libsolv' package built from this repository."
+    )
+
+CACHE_DEFAULT = Path(os.environ.get("NEXSOLV_CACHE_DIR", "/var/cache/nexsolv"))
+SYNC_DEFAULT = Path(os.environ.get("PACMAN_SYNC_DIR", "/var/lib/pacman/sync"))
+LOCAL_DEFAULT = Path(os.environ.get("PACMAN_LOCAL_DIR", "/var/lib/pacman/local"))
+
+SELECT_FLAGS = (
+    solv.Selection.SELECTION_NAME
+    | solv.Selection.SELECTION_PROVIDES
+    | solv.Selection.SELECTION_GLOB
+    | solv.Selection.SELECTION_CANON
+    | solv.Selection.SELECTION_DOTARCH
+    | solv.Selection.SELECTION_REL
+)
+
+TRANSACTION_LABELS = {
+    solv.Transaction.SOLVER_TRANSACTION_INSTALL: "Install",
+    solv.Transaction.SOLVER_TRANSACTION_ERASE: "Remove",
+    solv.Transaction.SOLVER_TRANSACTION_UPGRADED: "Upgrade",
+    solv.Transaction.SOLVER_TRANSACTION_DOWNGRADED: "Downgrade",
+    solv.Transaction.SOLVER_TRANSACTION_REINSTALLED: "Reinstall",
+    solv.Transaction.SOLVER_TRANSACTION_CHANGED: "Change",
+    solv.Transaction.SOLVER_TRANSACTION_OBSOLETED: "Obsolete",
+}
+
+
+def human_size(value: int) -> str:
+    value = int(value or 0)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value < 1024:
+        return f"{sign}{value} B"
+    for unit in ("KiB", "MiB", "GiB", "TiB"):
+        value /= 1024.0
+        if value < 1024.0:
+            return f"{sign}{value:.1f} {unit}"
+    return f"{sign}{value:.1f} PiB"
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def load_pool(args: argparse.Namespace) -> solv.Pool:
+    pool = solv.Pool()
+    if args.debug:
+        pool.set_debuglevel(2)
+    pool.setdisttype(pool.DISTTYPE_ARCH)
+    pool.setarch(platform.machine())
+
+    if not args.no_local and LOCAL_DEFAULT.is_dir():
+        local = pool.add_repo("@System")
+        local.add_arch_local(str(LOCAL_DEFAULT))
+        pool.installed = local
+    elif not args.no_local:
+        eprint(f"nexsolv: warning: local database not found: {LOCAL_DEFAULT}")
+
+    caches = sorted(CACHE_DEFAULT.glob("*.solv"))
+    caches = [path for path in caches if path.name != "local.solv"]
+    if not caches:
+        raise RuntimeError(
+            f"no repository caches in {CACHE_DEFAULT}; run 'nexsolv-sync' first"
+        )
+
+    for path in caches:
+        repo = pool.add_repo(path.stem)
+        if not repo.add_solv(str(path)):
+            raise RuntimeError(f"failed to load {path}: {pool.errstr}")
+
+    pool.createwhatprovides()
+    return pool
+
+
+def select(pool: solv.Pool, pattern: str) -> solv.Selection:
+    return pool.select(pattern, SELECT_FLAGS)
+
+
+def installed_matches(pool: solv.Pool, pattern: str) -> list:
+    installed = getattr(pool, "installed", None)
+    if installed is None:
+        return []
+    matches = [
+        pkg for pkg in installed.solvables if fnmatch.fnmatchcase(pkg.name, pattern)
+    ]
+    if not matches:
+        selection = select(pool, pattern)
+        matches = [pkg for pkg in selection.solvables() if pkg.isinstalled()]
+    return matches
+
+
+def print_problems(problems, args: argparse.Namespace) -> int:
+    for problem in problems:
+        print(f"Problem {problem.id + 1}: {problem}")
+        solutions = problem.solutions()
+        for solution in solutions:
+            print(f"  Solution {solution.id + 1}:")
+            for element in solution.elements(True):
+                print(f"    - {element}")
+    if args.solution is None:
+        eprint("nexsolv: use --solution N to apply one of the solutions")
+        return 2
+    return 0
+
+
+def apply_solution(pool, jobs, problems, index: int) -> bool:
+    for problem in problems:
+        solutions = problem.solutions()
+        if index < 1 or index > len(solutions):
+            continue
+        for element in solutions[index - 1].elements(True):
+            newjob = element.Job()
+            if element.type == solv.Solver.SOLVER_SOLUTION_JOB:
+                jobs[element.jobidx] = newjob
+            elif newjob is not None and newjob not in jobs:
+                jobs.append(newjob)
+        return True
+    return False
+
+
+def solve(pool, jobs, args, removing: bool = False) -> int:
+    solver = pool.Solver()
+    solver.set_flag(solv.Solver.SOLVER_FLAG_SPLITPROVIDES, 1)
+    if removing:
+        solver.set_flag(solv.Solver.SOLVER_FLAG_ALLOW_UNINSTALL, 1)
+
+    problems = solver.solve(jobs)
+    if problems:
+        if print_problems(problems, args) != 0:
+            return 2
+        if not apply_solution(pool, jobs, problems, args.solution):
+            eprint(f"nexsolv: no solution {args.solution}")
+            return 2
+        problems = solver.solve(jobs)
+        if problems:
+            print_problems(problems, args)
+            return 2
+
+    transaction = solver.transaction()
+    if transaction.isempty():
+        print("Nothing to do.")
+        return 0
+
+    print("Transaction summary:")
+    groups = transaction.classify(
+        solv.Transaction.SOLVER_TRANSACTION_SHOW_OBSOLETES
+        | solv.Transaction.SOLVER_TRANSACTION_OBSOLETE_IS_UPGRADE
+    )
+    for group in groups:
+        label = TRANSACTION_LABELS.get(group.type)
+        if not label:
+            continue
+        packages = sorted(group.solvables(), key=lambda s: (s.name, s.evr))
+        print(f"  {label} {len(packages)} package(s):")
+        for pkg in packages:
+            if group.type in (
+                solv.Transaction.SOLVER_TRANSACTION_UPGRADED,
+                solv.Transaction.SOLVER_TRANSACTION_DOWNGRADED,
+            ):
+                old = transaction.othersolvable(pkg)
+                print(f"    {pkg.name} {old.evr if old else '?'} -> {pkg.evr}")
+            elif group.type == solv.Transaction.SOLVER_TRANSACTION_ERASE:
+                print(f"    {pkg.name} {pkg.evr}")
+            else:
+                print(f"    {pkg.name} {pkg.evr} [{pkg.repo.name}]")
+
+    new_packages = transaction.newsolvables()
+    download_size = sum(
+        int(pkg.lookup_num(solv.SOLVABLE_DOWNLOADSIZE) or 0)
+        for pkg in new_packages
+    )
+    print(f"  Download size: {human_size(download_size)}")
+    print(f"  Install size change: {human_size(transaction.calc_installsizechange())}")
+    print("Dry-run only: no packages were changed.")
+    return 0
+
+
+def cmd_install(pool, args) -> int:
+    jobs = []
+    for pattern in args.packages:
+        selection = select(pool, pattern)
+        if selection.isempty():
+            print(f"nothing matches '{pattern}'")
+            return 1
+        jobs.extend(selection.jobs(solv.Job.SOLVER_INSTALL))
+    return solve(pool, jobs, args)
+
+
+def cmd_remove(pool, args) -> int:
+    jobs = []
+    for pattern in args.packages:
+        matches = installed_matches(pool, pattern)
+        if not matches:
+            print(f"'{pattern}' is not installed")
+            return 1
+        for pkg in matches:
+            jobs.append(
+                pool.Job(
+                    solv.Job.SOLVER_ERASE | solv.Job.SOLVER_SOLVABLE,
+                    pkg.id,
+                )
+            )
+    return solve(pool, jobs, args, removing=True)
+
+
+def cmd_upgrade(pool, args) -> int:
+    jobs = []
+    if args.packages:
+        for pattern in args.packages:
+            matches = installed_matches(pool, pattern)
+            if not matches:
+                print(f"'{pattern}' is not installed")
+                return 1
+            for pkg in matches:
+                jobs.append(
+                    pool.Job(
+                        solv.Job.SOLVER_UPDATE | solv.Job.SOLVER_SOLVABLE,
+                        pkg.id,
+                    )
+                )
+    else:
+        installed = getattr(pool, "installed", None)
+        if installed is None:
+            print("no installed packages")
+            return 0
+        for pkg in installed.solvables:
+            jobs.append(
+                pool.Job(
+                    solv.Job.SOLVER_UPDATE | solv.Job.SOLVER_SOLVABLE,
+                    pkg.id,
+                )
+            )
+    if not jobs:
+        print("Nothing to do.")
+        return 0
+    return solve(pool, jobs, args)
+
+
+def cmd_dist_upgrade(pool, args) -> int:
+    selection = pool.Selection_all()
+    jobs = selection.jobs(solv.Job.SOLVER_DISTUPGRADE)
+    if not jobs:
+        print("Nothing to do.")
+        return 0
+    return solve(pool, jobs, args)
+
+
+def cmd_search(pool, args) -> int:
+    needle = " ".join(args.terms).lower()
+    seen = set()
+    for repo in pool.repos:
+        for pkg in repo.solvables:
+            summary = pkg.lookup_str(solv.SOLVABLE_SUMMARY) or ""
+            haystack = f"{pkg.name} {summary}".lower()
+            if needle not in haystack:
+                continue
+            key = (pkg.name, pkg.evr, pkg.arch, repo.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            marker = " [installed]" if pkg.isinstalled() else ""
+            print(f"{pkg.name} {pkg.evr} [{repo.name}]{marker}")
+            if summary:
+                print(f"    {summary}")
+    return 0
+
+
+def cmd_list(pool, args) -> int:
+    patterns = [p.lower() for p in args.packages]
+    for repo in pool.repos:
+        for pkg in repo.solvables:
+            if patterns and not any(p in pkg.name.lower() for p in patterns):
+                continue
+            marker = " [installed]" if pkg.isinstalled() else ""
+            print(f"{pkg.name} {pkg.evr} {pkg.arch} [{repo.name}]{marker}")
+    return 0
+
+
+def cmd_info(pool, args) -> int:
+    for pattern in args.packages:
+        selection = select(pool, pattern)
+        matches = list(selection.solvables())
+        if not matches:
+            print(f"nothing matches '{pattern}'")
+            return 1
+        for pkg in matches:
+            location, _ = pkg.lookup_location()
+            print(f"Name:         {pkg.name}")
+            print(f"Version:      {pkg.evr}")
+            print(f"Architecture: {pkg.arch}")
+            print(f"Repository:   {pkg.repo.name}")
+            print(f"Installed:    {'yes' if pkg.isinstalled() else 'no'}")
+            if location:
+                print(f"Filename:     {location}")
+            download = pkg.lookup_num(solv.SOLVABLE_DOWNLOADSIZE)
+            if download:
+                print(f"Download:     {human_size(download)}")
+            installed_size = pkg.lookup_num(solv.SOLVABLE_INSTALLSIZE)
+            if installed_size:
+                print(f"Installed size: {human_size(installed_size)}")
+            for key, label in (
+                (solv.SOLVABLE_URL, "URL"),
+                (solv.SOLVABLE_LICENSE, "License"),
+                (solv.SOLVABLE_PACKAGER, "Packager"),
+            ):
+                value = pkg.lookup_str(key)
+                if value:
+                    print(f"{label + ':':13}{value}")
+            summary = pkg.lookup_str(solv.SOLVABLE_SUMMARY)
+            if summary:
+                print(f"Summary:      {summary}")
+            description = pkg.lookup_str(solv.SOLVABLE_DESCRIPTION)
+            if description:
+                print("Description:")
+                print(description)
+            print()
+    return 0
+
+
+def cmd_repolist(pool, args) -> int:
+    for repo in pool.repos:
+        marker = " [installed]" if repo is getattr(pool, "installed", None) else ""
+        print(f"{repo.name:24} {len(list(repo.solvables)):6} packages{marker}")
+    return 0
+
+
+def cmd_sync(args) -> int:
+    helper = os.environ.get("NEXSOLV_SYNC", "nexsolv-sync")
+    command = [
+        helper,
+        "--sync-dir",
+        str(SYNC_DEFAULT),
+        "--local-dir",
+        str(LOCAL_DEFAULT),
+        "--output",
+        str(CACHE_DEFAULT),
+    ]
+    try:
+        return subprocess.run(command, check=False).returncode
+    except FileNotFoundError:
+        eprint(f"nexsolv: {helper} not found")
+        return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="nexsolv",
+        description="Resolve Arch Linux package transactions with libsolv "
+        "(dry-run, never changes the system).",
+    )
+    parser.add_argument("--cache-dir", type=Path, default=CACHE_DEFAULT)
+    parser.add_argument("--sync-dir", type=Path, default=SYNC_DEFAULT)
+    parser.add_argument("--local-dir", type=Path, default=LOCAL_DEFAULT)
+    parser.add_argument("--no-local", action="store_true", help="ignore the local pacman database")
+    parser.add_argument("--solution", type=int, default=None, help="apply solution N for solver problems")
+    parser.add_argument("--debug", action="store_true", help="enable libsolv debug output")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    install = sub.add_parser("install", help="resolve installation of packages")
+    install.add_argument("packages", nargs="+")
+    install.set_defaults(func=cmd_install)
+
+    remove = sub.add_parser("remove", help="resolve removal of packages")
+    remove.add_argument("packages", nargs="+")
+    remove.set_defaults(func=cmd_remove)
+
+    upgrade = sub.add_parser("upgrade", help="resolve upgrades of installed packages")
+    upgrade.add_argument("packages", nargs="*")
+    upgrade.set_defaults(func=cmd_upgrade)
+
+    dist = sub.add_parser("dist-upgrade", help="resolve a full distribution upgrade")
+    dist.set_defaults(func=cmd_dist_upgrade)
+
+    search = sub.add_parser("search", help="search package names and summaries")
+    search.add_argument("terms", nargs="+")
+    search.set_defaults(func=cmd_search)
+
+    lst = sub.add_parser("list", help="list available packages")
+    lst.add_argument("packages", nargs="*")
+    lst.set_defaults(func=cmd_list)
+
+    info = sub.add_parser("info", help="show package details")
+    info.add_argument("packages", nargs="+")
+    info.set_defaults(func=cmd_info)
+
+    repolist = sub.add_parser("repolist", help="list loaded repositories")
+    repolist.set_defaults(func=cmd_repolist)
+
+    sync = sub.add_parser("sync", help="rebuild .solv caches from pacman databases")
+    sync.set_defaults(func=lambda pool, args: cmd_sync(args))
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    global CACHE_DEFAULT, SYNC_DEFAULT, LOCAL_DEFAULT
+    CACHE_DEFAULT = args.cache_dir
+    SYNC_DEFAULT = args.sync_dir
+    LOCAL_DEFAULT = args.local_dir
+
+    if args.command == "sync":
+        return cmd_sync(args)
+
+    try:
+        pool = load_pool(args)
+    except RuntimeError as error:
+        eprint(f"nexsolv: {error}")
+        return 1
+    return args.func(pool, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

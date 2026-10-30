@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# nexsolv-sync - build libsolv .solv caches from pacman databases.
+#
+# Arch's repository databases are gzip-compressed tar archives.  libsolv's
+# archrepo2solv tool expects the decompressed tar stream, so this helper takes
+# care of decompression and writes one .solv file per repository.
+set -euo pipefail
+
+SYNC_DIR=${PACMAN_SYNC_DIR:-/var/lib/pacman/sync}
+LOCAL_DIR=${PACMAN_LOCAL_DIR:-/var/lib/pacman/local}
+OUT_DIR=${NEXSOLV_CACHE_DIR:-/var/cache/nexsolv}
+QUIET=0
+VERBOSE=0
+
+usage() {
+    cat <<'EOF'
+Usage: nexsolv-sync [options]
+
+Convert pacman repository and local databases into libsolv .solv caches.
+
+Options:
+  -s, --sync-dir DIR    pacman sync database directory (default: /var/lib/pacman/sync)
+  -l, --local-dir DIR   pacman local database directory (default: /var/lib/pacman/local)
+  -o, --output DIR      output cache directory (default: /var/cache/nexsolv)
+  -q, --quiet           only print errors
+  -v, --verbose         print each generated file
+  -h, --help            show this help
+
+Environment:
+  PACMAN_SYNC_DIR, PACMAN_LOCAL_DIR, NEXSOLV_CACHE_DIR
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -s|--sync-dir) SYNC_DIR=${2:?missing value for $1}; shift 2 ;;
+        -l|--local-dir) LOCAL_DIR=${2:?missing value for $1}; shift 2 ;;
+        -o|--output) OUT_DIR=${2:?missing value for $1}; shift 2 ;;
+        -q|--quiet) QUIET=1; shift ;;
+        -v|--verbose) VERBOSE=1; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --sync-dir=*) SYNC_DIR=${1#*=}; shift ;;
+        --local-dir=*) LOCAL_DIR=${1#*=}; shift ;;
+        --output=*) OUT_DIR=${1#*=}; shift ;;
+        *) echo "nexsolv-sync: unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
+
+if ! command -v archrepo2solv >/dev/null 2>&1; then
+    echo "nexsolv-sync: archrepo2solv not found (install the libsolv package)" >&2
+    exit 1
+fi
+
+if ! mkdir -p "$OUT_DIR"; then
+    echo "nexsolv-sync: cannot create $OUT_DIR" >&2
+    exit 1
+fi
+
+tmp=$(mktemp "$OUT_DIR/.nexsolv-sync.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+
+decompress() {
+    local file=$1
+    # Detect the compression by magic bytes.  pacman uses gzip today, but
+    # support zstd/xz so a future pacman change does not break the helper.
+    local magic
+    magic=$(od -An -tx1 -N2 "$file" | tr -d ' \n')
+    case "$magic" in
+        1f8b) gzip -dc -- "$file" ;;
+        28b5) zstd -dc -- "$file" ;;
+        fd37) xz -dc -- "$file" ;;
+        *) cat -- "$file" ;;
+    esac
+}
+
+count=0
+shopt -s nullglob
+for db in "$SYNC_DIR"/*.db; do
+    name=$(basename "$db" .db)
+    decompress "$db" | archrepo2solv > "$tmp"
+    chmod 644 "$tmp"
+    mv -- "$tmp" "$OUT_DIR/$name.solv"
+    count=$((count + 1))
+    if [ "$QUIET" -eq 0 ] && [ "$VERBOSE" -eq 1 ]; then
+        printf '  %s -> %s\n' "$db" "$OUT_DIR/$name.solv"
+    fi
+done
+
+if [ -d "$LOCAL_DIR" ]; then
+    archrepo2solv -l "$LOCAL_DIR" > "$tmp"
+    chmod 644 "$tmp"
+    mv -- "$tmp" "$OUT_DIR/local.solv"
+    count=$((count + 1))
+    if [ "$QUIET" -eq 0 ] && [ "$VERBOSE" -eq 1 ]; then
+        printf '  %s -> %s\n' "$LOCAL_DIR" "$OUT_DIR/local.solv"
+    fi
+fi
+
+if [ "$count" -eq 0 ]; then
+    echo "nexsolv-sync: no pacman databases found in $SYNC_DIR" >&2
+    exit 1
+fi
+
+if [ "$QUIET" -eq 0 ]; then
+    printf 'nexsolv-sync: wrote %d cache(s) to %s\n' "$count" "$OUT_DIR"
+fi

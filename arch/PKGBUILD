@@ -1,0 +1,77 @@
+# Maintainer: Nexus Linux <nexus@nexuslinux.org>
+# Arch-adapted libsolv build. Unlike Arch's extra/libsolv package this build
+# uses -DARCHLINUX=ON, so libsolv defaults to DISTTYPE_ARCH and pacman's
+# version comparison rules instead of RPM semantics.
+pkgname=libsolv
+pkgver=0.7.41
+pkgrel=2
+pkgdesc="Library for solving packages and reading repositories (Nexus Arch fork)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Nexus-Linux-Official/nexsolv"
+license=('BSD-3-Clause')
+depends=('bzip2' 'expat' 'rpm-tools' 'xz' 'zlib' 'zstd' 'python')
+makedepends=('cmake' 'perl' 'python' 'ruby' 'swig')
+optdepends=('perl: Perl bindings'
+            'ruby: Ruby bindings')
+source=("libsolv-$pkgver.tar.gz::https://github.com/openSUSE/libsolv/archive/$pkgver/libsolv-$pkgver.tar.gz"
+        "nexsolv"
+        "nexsolv-sync")
+sha256sums=('38b4ee1924f8bd1ec0f6b2ec147e4c54c6deac132db5f90b4214b43ccd32fdd6'
+            'f08d60f46e092e0bb33a4a1f45f7ee535a832efe8d2d5a5b431077f863053a73'
+            '5622d70cc1f9f31ec35510da011158fe8c81a8c5ed8ec519884699db0b1abcf6')
+
+build() {
+  cd "$pkgname-$pkgver"
+
+  cmake -B build \
+        -DCMAKE_BUILD_TYPE=None \
+        -DCMAKE_C_FLAGS_RELEASE='-DNDEBUG' \
+        -DCMAKE_INSTALL_PREFIX=/usr \
+        -DCMAKE_INSTALL_LIBDIR=lib \
+        -DUSE_VENDORDIRS=ON \
+        -DARCHLINUX=ON \
+        -DENABLE_APPDATA=ON \
+        -DENABLE_ARCHREPO=ON \
+        -DENABLE_BZIP2_COMPRESSION=ON \
+        -DENABLE_COMPLEX_DEPS=1 \
+        -DENABLE_COMPS=ON \
+        -DENABLE_CONDA=ON \
+        -DENABLE_CUDFREPO=ON \
+        -DENABLE_DEBIAN=ON \
+        -DENABLE_HAIKU=OFF \
+        -DENABLE_HELIXREPO=ON \
+        -DENABLE_LZMA_COMPRESSION=ON \
+        -DENABLE_MDKREPO=ON \
+        -DENABLE_PERL=ON \
+        -DENABLE_PUBKEY=ON \
+        -DENABLE_PYTHON=ON \
+        -DENABLE_RPMDB=ON \
+        -DENABLE_RPMDB_BYRPMHEADER=ON \
+        -DENABLE_RPMDB_LIBRPM=ON \
+        -DENABLE_RPMMD=ON \
+        -DENABLE_RPMPKG=ON \
+        -DENABLE_RUBY=ON \
+        -DENABLE_SUSEREPO=ON \
+        -DENABLE_TCL=OFF \
+        -DENABLE_ZSTD_COMPRESSION=ON \
+        -DMULTI_SEMANTICS=ON
+
+  make -C build
+}
+
+check() {
+  cd "$pkgname-$pkgver"
+  make -C build ARGS="-V" test
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  make -C build DESTDIR="$pkgdir/" install
+
+  install -Dp -m644 LICENSE.BSD "$pkgdir/usr/share/licenses/$pkgname/LICENSE.BSD"
+  install -Dp -m644 README "$pkgdir/usr/share/doc/$pkgname/README"
+
+  install -Dm755 "$srcdir/nexsolv" "$pkgdir/usr/bin/nexsolv"
+  install -Dm755 "$srcdir/nexsolv-sync" "$pkgdir/usr/bin/nexsolv-sync"
+}
